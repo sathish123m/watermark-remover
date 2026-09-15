@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.mp4
+*.log
+.DS_Store
+watermark-remover-data/
