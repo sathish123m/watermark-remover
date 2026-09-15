@@ -1,0 +1,19 @@
+# fly.io configuration - `fly launch` fills in the app name and region.
+# Full process: see README.md "Deploy".
+
+[build]
+# uses the Dockerfile (python + ffmpeg + numpy + opencv + rapidocr)
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # the machine sleeps when idle (saves money) and wakes on first request
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+# persistent storage for uploads, cleaned videos and the SQLite library.
+# create it before deploying:  fly volumes create wm_data --size 3
+[[mounts]]
+  source = "wm_data"
+  destination = "/data"
