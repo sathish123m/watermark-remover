@@ -48,13 +48,42 @@ docker run -p 8080:8080 -v wm-data:/data watermark-remover
 
 ## Deploy
 
-The included Dockerfile reads `PORT` and binds `0.0.0.0`, so it drops
-straight into Render / Railway / Fly.io / any container host. Mount a
-volume at `/data` to keep the video library between deploys.
+The included Dockerfile reads `PORT` and binds `0.0.0.0`, so it works on
+Render / Railway / Fly.io / any container host. Mount a volume at `/data`
+to keep the video library between deploys.
+
+### Render
+
+1. New + → **Blueprint** → pick this repo → Render reads `render.yaml`
+   (or: New + → Web Service → Docker → add a 5 GB disk mounted at `/data`).
+2. Use **at least the Starter plan**. The free plan (512 MB, no disk) is
+   too small for video processing — jobs will stall and the library
+   resets on every deploy.
+3. Deploy. First build takes ~5–10 minutes (installs ffmpeg + OCR).
+
+### Fly.io
+
+```bash
+fly launch          # picks up fly.toml
+fly scale memory 1024
+fly deploy
+```
 
 > ⚠️ **If you deploy publicly, add an auth layer** (e.g. the platform's
 > basic auth or a reverse proxy). As shipped, anyone who can reach the
 > page can upload and process videos.
+
+### Honest performance expectations
+
+Processing is CPU-bound and single-threaded per job. Expect roughly:
+
+- laptop: a 15 s clip in ~2–4 min
+- Render/Fly starter (shared vCPU): ~3× slower than a laptop
+- uploads are limited by your connection — the app shows a live upload
+  progress bar, and processing shows frame count + ETA
+
+The job watchdog fails a job with a clear message instead of hanging
+forever if the server runs out of memory.
 
 ## Android (Termux)
 

@@ -1,0 +1,18 @@
+# Render.com deployment definition.
+# On Render: New + -> Blueprint -> pick this repo -> it reads this file.
+#
+# IMPORTANT: the free plan has 512 MB RAM and no persistent disk — too
+# small for video processing (jobs will stall and uploads/library reset on
+# every deploy). Use at least the `starter` plan as below.
+
+services:
+  - type: web
+    name: watermark-remover
+    runtime: docker
+    plan: starter          # 512MB free plan is NOT enough for video work
+    healthCheckPath: /
+    autoDeploy: true
+    disk:
+      name: wm_data
+      mountPath: /data
+      sizeGB: 5            # stores uploads + cleaned videos + the library db

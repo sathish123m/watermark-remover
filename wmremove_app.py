@@ -49,9 +49,20 @@ except ImportError:
     _cv2 = None
 try:
     from rapidocr_onnxruntime import RapidOCR as _RapidOCR
-    _OCR = _RapidOCR()
 except Exception:
-    _OCR = None
+    _RapidOCR = None
+
+_OCR = None
+
+
+def get_ocr():
+    """Load the OCR engine on first use — it eats ~200 MB RAM, so keep it
+    out of the baseline footprint on small servers (Render free = 512 MB).
+    """
+    global _OCR
+    if _OCR is None and _RapidOCR is not None:
+        _OCR = _RapidOCR()
+    return _OCR
 
 # OpenCV gives noticeably better inpainting when available (e.g. on a
 # computer); on Termux the numpy diffusion fallback is used instead.
@@ -273,9 +284,10 @@ def decode_jpeg(data):
 
 def ocr_texts(img):
     """[{text, conf, box:[x,y,w,h]}] for readable text in a frame."""
-    if _OCR is None or img is None:
+    engine = get_ocr()
+    if engine is None or img is None:
         return []
-    result, _ = _OCR(img)
+    result, _ = engine(img)
     out = []
     for box, text, conf in (result or []):
         xs = [p[0] for p in box]
@@ -489,7 +501,7 @@ def process_video(inp, outp, regions, track_box, move, progress):
 
         writer.stdin.write(frame.tobytes())
         n += 1
-        progress(min(99, int(100 * n / est_total)))
+        progress(min(99, int(100 * n / est_total)), n)
         frame = next(it, None)
 
     writer.stdin.close()
@@ -578,9 +590,39 @@ def auto_detect_boxes(inp, max_boxes=4):
 
 def run_job(job_id, inp, outp, regions, track_box, move, video_id=None):
     try:
+        t0 = time.time()
+
+        def cb(pct, frames=0):
+            elapsed = max(0.1, time.time() - t0)
+            fps = frames / elapsed
+            eta = int((100 - pct) / max(pct, 1) * elapsed)
+            JOBS[job_id].update(progress=pct, frames=frames,
+                                fps=round(fps, 2), eta=eta,
+                                tick=time.time())
+
+        def watchdog():
+            # if progress freezes (e.g. the host OOM-killed the worker or
+            # ffmpeg wedged), fail the job instead of spinning forever
+            last = None
+            while True:
+                time.sleep(20)
+                j = JOBS.get(job_id)
+                if not j or j.get("status") != "running":
+                    return
+                tick = j.get("tick", 0)
+                if last is not None and tick == last:
+                    JOBS[job_id].update(
+                        status="error",
+                        error="processing stalled (no progress for ~2 min). "
+                              "The server most likely ran out of memory — "
+                              "try a shorter clip, or run on a plan with "
+                              "1 GB+ RAM.")
+                    return
+                last = tick
+
+        threading.Thread(target=watchdog, daemon=True).start()
         n, misses, w, h, fps = process_video(
-            inp, outp, regions, track_box, move,
-            lambda p: JOBS[job_id].update(progress=p))
+            inp, outp, regions, track_box, move, cb)
         JOBS[job_id].update(status="done", progress=100, out=outp,
                             message=f"cleaned ({n} frames)")
         with db() as c:
@@ -674,22 +716,54 @@ let state = {id:null, name:'', vw:0, vh:0, img:null,
 const $ = s => document.querySelector(s);
 const cv = $('#cv'), ctx = cv.getContext('2d');
 
+function uploadWithProgress(file, onp) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) onp(Math.round(100 * e.loaded / e.total));
+    };
+    xhr.onload = () => resolve(JSON.parse(xhr.responseText));
+    xhr.onerror = () => reject(new Error('upload failed'));
+    xhr.send(file);
+  });
+}
+
 $('#pick').addEventListener('change', async e => {
   const f = e.target.files[0];
   if (!f) return;
+  if (f.size > 200*1024*1024 &&
+      !confirm('That video is ' + (f.size/1e6).toFixed(0) + ' MB. On a small ' +
+               'server this can take a very long time to upload AND process. ' +
+               'Continue anyway?')) {
+    e.target.value = ''; return;
+  }
   $('#step1').classList.add('hidden');
-  $('#step2').classList.remove('hidden');
-  const r = await fetch('/api/upload', {method:'POST',
-    headers:{'X-Filename': encodeURIComponent(f.name)}, body: f});
-  const j = await r.json();
-  state.id = j.id; state.name = j.name;
-  const fr = await fetch('/api/frame?id=' + state.id);
-  const blob = await fr.blob();
-  state.img = await createImageBitmap(blob);
-  state.vw = state.img.width; state.vh = state.img.height;
-  cv.width = state.vw; cv.height = state.vh;
-  state.boxes = [];
-  render(); listBoxes();
+  $('#step3').classList.remove('hidden');
+  $('#fill').style.width = '0%';
+  $('#msg').textContent = 'Uploading… 0%';
+  try {
+    const j = await uploadWithProgress(f, p => {
+      $('#msg').textContent = `Uploading… ${p}%  ` +
+        `(${(f.size*p/100/1e6).toFixed(1)} / ${(f.size/1e6).toFixed(1)} MB)`;
+      $('#fill').style.width = p + '%';
+    });
+    state.id = j.id; state.name = j.name;
+    $('#msg').textContent = 'Reading first frame…';
+    const fr = await fetch('/api/frame?id=' + state.id);
+    const blob = await fr.blob();
+    state.img = await createImageBitmap(blob);
+    state.vw = state.img.width; state.vh = state.img.height;
+    cv.width = state.vw; cv.height = state.vh;
+    state.boxes = [];
+    $('#step3').classList.add('hidden');
+    $('#step2').classList.remove('hidden');
+    render(); listBoxes();
+  } catch (err) {
+    $('#msg').textContent = '❌ Upload failed — check your connection and retry';
+    $('#again').classList.remove('hidden');
+  }
 });
 
 function render() {
@@ -808,9 +882,16 @@ async function poll() {
   const r = await fetch('/api/status?job=' + state.job);
   const j = await r.json();
   $('#fill').style.width = (j.progress || 0) + '%';
+  let eta = '';
+  if (j.eta) {
+    eta = j.eta > 90 ? ` — about ${Math.round(j.eta/60)} min left`
+                     : ` — about ${j.eta}s left`;
+  }
   $('#msg').textContent = j.status === 'error'
     ? '❌ ' + (j.error || 'failed')
-    : (j.status === 'done' ? '✅ Done!' : 'Removing watermark… ' + (j.progress||0) + '%');
+    : (j.status === 'done' ? '✅ Done!'
+       : `Removing watermark… ${j.progress||0}%` +
+         (j.frames ? ` (frame ${j.frames})` : '') + eta);
   if (j.status === 'done') {
     $('#step3').classList.add('hidden');
     $('#step4').classList.remove('hidden');
@@ -920,6 +1001,40 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, path, ctype, name=None):
+        """Stream a file from disk with Range support. Never loads the
+        whole video into memory (kills small servers)."""
+        size = os.path.getsize(path)
+        start, end, code = 0, size - 1, 200
+        rng = self.headers.get("Range")
+        if rng and rng.startswith("bytes="):
+            a, _, b = rng[6:].partition("-")
+            start = int(a or 0)
+            end = min(int(b) if b else size - 1, size - 1)
+            code = 206
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        if code == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(end - start + 1))
+        if name:
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{name}"')
+        self.end_headers()
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                left = end - start + 1
+                while left:
+                    chunk = fh.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # browser stopped pulling; harmless
+
     def do_GET(self):
         from urllib.parse import urlparse, parse_qs
         u = urlparse(self.path)
@@ -985,17 +1100,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad kind"}, 400)
             if not os.path.exists(path):
                 return self._json({"error": "file missing"}, 404)
-            data = open(path, "rb").read()
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition",
-                             f'attachment; filename="{fname}"')
-            self.end_headers()
-            try:
-                self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            self._send_file(path, "video/mp4", fname)
         elif u.path == "/api/frame":
             up = UPLOADS.get(q["id"][0])
             if not up:
@@ -1016,36 +1121,8 @@ class Handler(BaseHTTPRequestHandler):
             job = JOBS.get(q["job"][0])
             if not job or job.get("status") != "done":
                 return self._json({"error": "not ready"}, 404)
-            data = open(job["out"], "rb").read()
-            size = len(data)
-            try:
-                rng = self.headers.get("Range")
-                if rng and not q.get("save"):
-                    # browsers stream <video> with range requests
-                    a, _, b = rng.replace("bytes=", "").partition("-")
-                    a = int(a or 0)
-                    b = min(int(b) if b else size - 1, size - 1)
-                    chunk = data[a:b + 1]
-                    self.send_response(206)
-                    self.send_header("Content-Type", "video/mp4")
-                    self.send_header("Content-Range",
-                                     f"bytes {a}-{b}/{size}")
-                    self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Content-Length", str(len(chunk)))
-                    self.end_headers()
-                    self.wfile.write(chunk)
-                else:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "video/mp4")
-                    self.send_header("Content-Length", str(size))
-                    self.send_header("Accept-Ranges", "bytes")
-                    if q.get("save"):
-                        self.send_header("Content-Disposition",
-                                         'attachment; filename="clean.mp4"')
-                    self.end_headers()
-                    self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # browser closed the stream early; harmless
+            self._send_file(job["out"], "video/mp4",
+                            "clean.mp4" if q.get("save") else None)
         else:
             self._json({"error": "not found"}, 404)
 
